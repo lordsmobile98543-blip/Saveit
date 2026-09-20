@@ -1,6 +1,5 @@
 import asyncio
 import os
-import sys
 import time
 from pathlib import Path
 
@@ -9,535 +8,210 @@ from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 
 
-# ============================================================
-# CONFIGURATION
-# ============================================================
+load_dotenv()
 
-BASE_DIR = Path(__file__).resolve().parent
+api_id = os.getenv("API_ID")
+api_hash = os.getenv("API_HASH")
+handler = os.getenv("HANDLER", ".saveit")
+auto_save_timed = os.getenv("AUTO_SAVE_TIMED", "true").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
-ENV_FILE = BASE_DIR / ".env"
+# Auto-delete configuration
+AUTO_DELETE_HOURS = float(os.getenv("AUTO_DELETE_HOURS", "4"))
+auto_delete_enabled = os.getenv("AUTO_DELETE_ENABLED", "true").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
-# Default local download directory.
-# Can be overridden with DOWNLOAD_DIR in .env.
-DEFAULT_DOWNLOAD_DIR = BASE_DIR / "downloads"
+# Session string — paste yours in .env
+SESSION_STRING = os.getenv("SESSION_STRING", "").strip()
 
-
-# ============================================================
-# LOAD ENVIRONMENT
-# ============================================================
-
-load_dotenv(ENV_FILE)
-
-
-def get_required_env(name: str) -> str:
-    value = os.getenv(name)
-
-    if not value:
-        raise RuntimeError(
-            f"Missing required environment variable: {name}"
-        )
-
-    return value.strip()
-
-
-# Telegram credentials
-API_ID = int(get_required_env("API_ID"))
-API_HASH = get_required_env("API_HASH")
-SESSION_STRING = get_required_env("SESSION_STRING")
-
-# Command
-HANDLER = os.getenv("HANDLER", ".saveit").strip()
-
-# Download directory
-DOWNLOAD_DIR = Path(
-    os.getenv(
-        "DOWNLOAD_DIR",
-        str(DEFAULT_DOWNLOAD_DIR)
+if not SESSION_STRING:
+    raise RuntimeError(
+        "SESSION_STRING not found in .env. "
+        "Get one from @StringFatherBot and add it: SESSION_STRING=your_string_here"
     )
-).expanduser()
 
-DOWNLOAD_DIR.mkdir(
-    parents=True,
-    exist_ok=True
-)
+downloads_path = Path("downloads")
+saved_message_ids = set()
+save_lock = asyncio.Lock()
+your_user_id = None
 
-
-# ============================================================
-# TELEGRAM CLIENT
-# ============================================================
-
+# Initialize client with your existing session string
 client = TelegramClient(
     StringSession(SESSION_STRING),
-    API_ID,
-    API_HASH
+    api_id,
+    api_hash
 )
 
 
-# ============================================================
-# GLOBAL STATE
-# ============================================================
-
-YOUR_USER_ID = None
-
-processed_messages = set()
-
-save_lock = asyncio.Lock()
-
-
-# ============================================================
-# HELPERS
-# ============================================================
-
-def format_size(value):
-    """Convert bytes to a human-readable size."""
-
-    if value is None:
-        return "0 B"
-
-    value = float(value)
-
-    units = [
-        "B",
-        "KB",
-        "MB",
-        "GB",
-        "TB"
-    ]
-
-    for unit in units:
-
-        if value < 1024:
-            return f"{value:.2f} {unit}"
-
-        value /= 1024
-
-    return f"{value:.2f} PB"
-
-
-def format_duration(seconds):
-    """Convert seconds to readable time."""
-
-    if seconds is None or seconds < 0:
-        return "--"
-
-    seconds = int(seconds)
-
-    if seconds < 60:
-        return f"{seconds}s"
-
-    minutes, seconds = divmod(
-        seconds,
-        60
+def is_timed_media(message):
+    """Telegram exposes the self-destruct timer on the media object."""
+    return bool(
+        message
+        and message.media
+        and getattr(message.media, "ttl_seconds", None)
     )
 
-    if minutes < 60:
-        return f"{minutes}m {seconds}s"
 
-    hours, minutes = divmod(
-        minutes,
-        60
-    )
+async def save_media(message, sender_id):
+    message_key = (message.chat_id, message.id)
 
-    return f"{hours}h {minutes}m"
-
-
-class Progress:
-    """Simple terminal progress display."""
-
-    def __init__(self, name):
-        self.name = name
-        self.start_time = time.monotonic()
-        self.last_update = 0
-
-    def callback(self, current, total):
-
-        now = time.monotonic()
-
-        # Limit terminal updates.
-        if (
-            now - self.last_update < 0.5
-            and current < total
-        ):
-            return
-
-        self.last_update = now
-
-        elapsed = now - self.start_time
-
-        if elapsed <= 0:
-            elapsed = 0.001
-
-        speed = current / elapsed
-
-        if total:
-            percentage = (
-                current / total
-            ) * 100
-
-            remaining = (
-                total - current
-            ) / speed if speed else None
-
-        else:
-            percentage = 0
-            remaining = None
-
-        bar_length = 30
-
-        filled = int(
-            bar_length
-            * percentage
-            / 100
-        )
-
-        bar = (
-            "█" * filled
-            + "░" * (bar_length - filled)
-        )
-
-        line = (
-            f"\r{self.name}: "
-            f"[{bar}] "
-            f"{percentage:6.2f}% | "
-            f"{format_size(current)}"
-        )
-
-        if total:
-            line += (
-                f" / {format_size(total)}"
-            )
-
-        line += (
-            f" | {format_size(speed)}/s"
-            f" | ETA {format_duration(remaining)}"
-        )
-
-        print(
-            line,
-            end="",
-            flush=True
-        )
-
-        if total and current >= total:
-            print()
-
-
-# ============================================================
-# SAVE MEDIA
-# ============================================================
-
-async def save_media(
-    message,
-    sender_id
-):
-    """
-    Download media to DOWNLOAD_DIR and
-    upload it to Telegram Saved Messages.
-    """
-
-    if not message:
-        raise RuntimeError(
-            "Message not found."
-        )
-
-    if not message.media:
-        raise RuntimeError(
-            "The replied message has no media."
-        )
-
-    message_key = (
-        message.chat_id,
-        message.id
-    )
-
-    # Prevent duplicate processing.
     async with save_lock:
+        if message_key in saved_message_ids:
+            return
+        saved_message_ids.add(message_key)
 
-        if message_key in processed_messages:
-            raise RuntimeError(
-                "This message has already "
-                "been processed."
-            )
-
-        processed_messages.add(
-            message_key
-        )
+    downloads_path.mkdir(parents=True, exist_ok=True)
 
     try:
-
-        print()
-        print("=" * 70)
-
-        print(
-            f"Message ID : {message.id}"
-        )
-
-        print(
-            f"Sender     : {sender_id}"
-        )
-
-        print(
-            f"Download   : {DOWNLOAD_DIR}"
-        )
-
-        print("=" * 70)
-
-        # ----------------------------------------------------
-        # DOWNLOAD
-        # ----------------------------------------------------
-
-        download_progress = Progress(
-            "Downloading"
-        )
-
-        file_path = await client.download_media(
-            message,
-            file=str(DOWNLOAD_DIR),
-            progress_callback=(
-                download_progress.callback
-            )
-        )
-
+        file_path = await client.download_media(message, file=str(downloads_path))
         if not file_path:
-            raise RuntimeError(
-                "Telegram did not return "
-                "a downloaded file."
-            )
-
-        file_path = Path(file_path)
-
-        print()
-        print(
-            f"Downloaded: {file_path}"
-        )
-
-        if file_path.exists():
-
-            size = file_path.stat().st_size
-
-            print(
-                f"Size: {format_size(size)}"
-            )
-
-        # ----------------------------------------------------
-        # UPLOAD TO SAVED MESSAGES
-        # ----------------------------------------------------
-
-        print()
-        print(
-            "Uploading to Saved Messages..."
-        )
-
-        upload_progress = Progress(
-            "Uploading"
-        )
+            raise RuntimeError("Telegram did not return a downloadable file")
 
         await client.send_file(
             "me",
-            str(file_path),
-            caption=(
-                f"Saved from {sender_id}"
-            ),
+            file_path,
+            caption=f"File saved from {sender_id}",
             force_document=True,
-            progress_callback=(
-                upload_progress.callback
-            )
         )
-
-        print()
-        print(
-            "✓ Successfully saved "
-            "to Telegram Saved Messages."
-        )
-
-        print(
-            f"Local copy: {file_path}"
-        )
-
-        print("=" * 70)
-        print()
-
+        print(f"Saved media from {sender_id}: {file_path}")
     except Exception:
-
         async with save_lock:
-            processed_messages.discard(
-                message_key
-            )
-
+            saved_message_ids.discard(message_key)
         raise
 
 
 # ============================================================
-# MANUAL SAVE COMMAND
+# AUTO-DELETE OLD FILES (every N hours)
 # ============================================================
 
-@client.on(
-    events.NewMessage(
-        pattern=lambda message: (
-            message.text or ""
-        ).strip() == HANDLER
-    )
-)
-async def save_command(event):
+async def auto_delete_loop():
+    """Periodically delete files older than AUTO_DELETE_HOURS from downloads/."""
+    while True:
+        await asyncio.sleep(AUTO_DELETE_HOURS * 3600)
+        try:
+            if not downloads_path.exists():
+                continue
 
-    # Only allow your own account
-    # to trigger the command.
-    if event.sender_id != YOUR_USER_ID:
-        return
+            now = time.time()
+            max_age = AUTO_DELETE_HOURS * 3600
+            deleted = 0
 
-    status = await event.respond(
-        "⏳ Downloading..."
-    )
+            for file in downloads_path.iterdir():
+                if not file.is_file():
+                    continue
 
-    # Command must be a reply.
-    if not event.reply_to_msg_id:
+                file_age = now - file.stat().st_mtime
+                if file_age > max_age:
+                    file.unlink()
+                    deleted += 1
+                    print(f"Auto-deleted old file: {file.name}")
 
-        await status.edit(
-            f"Reply to a media message "
-            f"and send {HANDLER}"
-        )
+            if deleted:
+                print(f"Auto-delete cleanup: removed {deleted} file(s) older than {AUTO_DELETE_HOURS}h")
 
+        except Exception as err:
+            print(f"Auto-delete error: {err}")
+
+
+# ============================================================
+# AUTO-SAVE TIMED MEDIA
+# ============================================================
+
+@client.on(events.NewMessage(incoming=True))
+async def auto_save_timed_media(event):
+    if not auto_save_timed or not is_timed_media(event.message):
         return
 
     try:
+        await save_media(event.message, event.sender_id)
+    except Exception as err:
+        print(f"Failed to auto-save timed media {event.chat_id}/{event.id}: {err}")
 
-        message = await event.get_reply_message()
 
-        if not message:
-            await status.edit(
-                "❌ Could not find the "
-                "replied message."
-            )
-            return
+# ============================================================
+# MANUAL SAVE COMMAND (silent — no visible status messages)
+# ============================================================
 
-        if not message.media:
-            await status.edit(
-                "❌ The replied message "
-                "doesn't contain media."
-            )
-            return
+@client.on(events.NewMessage(pattern=rf"^{handler}$"))
+async def download_with_handler(event):
+    if event.sender_id != your_user_id:
+        return
 
-        # Delete command message.
+    # Silently delete the command message — no "Downloading..." shown in chat
+    try:
+        await event.delete()
+    except Exception:
+        pass
+
+    if not event.reply_to_msg_id:
+        # Silently notify user in Saved Messages instead of the chat
         try:
-            await event.delete()
+            await client.send_message(
+                "me",
+                f"Reply to a media message with {handler} to save it."
+            )
         except Exception:
             pass
+        return
 
-        await save_media(
-            message,
-            str(message.sender_id)
-        )
+    message = await event.get_reply_message()
 
-        # Delete status message.
+    if not message or not message.media:
         try:
-            await status.delete()
+            await client.send_message(
+                "me",
+                "No media found in the replied message."
+            )
         except Exception:
             pass
+        return
 
-    except Exception as error:
-
-        print(
-            f"Save error: {error}"
-        )
-
+    try:
+        await save_media(message, str(message.sender_id))
+    except Exception as err:
+        # Send error only to Saved Messages, not the chat
         try:
-            await status.edit(
-                f"❌ Failed to save:\n{error}"
-            )
+            await client.send_message("me", f"Failed to save media: {err}")
         except Exception:
             pass
 
 
 # ============================================================
-# START CLIENT
+# MAIN
 # ============================================================
 
 async def main():
-
-    global YOUR_USER_ID
-
-    print()
-    print("=" * 70)
-    print("Telegram Media Saver")
-    print("=" * 70)
-
-    print(
-        f"Command      : {HANDLER}"
-    )
-
-    print(
-        f"Download dir : {DOWNLOAD_DIR}"
-    )
-
-    print()
-    print(
-        "Connecting to Telegram..."
-    )
+    global your_user_id
 
     await client.connect()
 
     if not await client.is_user_authorized():
-
         raise RuntimeError(
-            "The StringSession is not authorized. "
-            "Create a valid Telethon StringSession."
+            "SESSION_STRING is invalid or expired. "
+            "Generate a new one from @StringFatherBot and update .env"
         )
 
     me = await client.get_me()
+    your_user_id = me.id
 
-    YOUR_USER_ID = me.id
+    print(f"Running as {me.username or me.first_name} (ID: {your_user_id})")
+    print(f"Automatic timed-media saving: {'enabled' if auto_save_timed else 'disabled'}")
+    print(f"Auto-delete files: {'enabled' if auto_delete_enabled else 'disabled'} (every {AUTO_DELETE_HOURS}h)")
 
-    account_name = (
-        me.username
-        or me.first_name
-        or "Unknown"
-    )
-
-    print()
-    print(
-        f"✓ Logged in as: {account_name}"
-    )
-
-    print(
-        f"✓ User ID: {YOUR_USER_ID}"
-    )
-
-    print()
-    print(
-        f"Reply to a photo/video/document "
-        f"with {HANDLER}"
-    )
-
-    print()
-    print(
-        "Waiting for messages..."
-    )
-
-    print("=" * 70)
-    print()
+    # Start background auto-delete task
+    if auto_delete_enabled:
+        asyncio.create_task(auto_delete_loop())
 
     await client.run_until_disconnected()
 
 
-# ============================================================
-# RUN
-# ============================================================
-
 if __name__ == "__main__":
-
-    try:
-        asyncio.run(main())
-
-    except KeyboardInterrupt:
-
-        print(
-            "\nStopped."
-        )
-
-    except Exception as error:
-
-        print(
-            f"\nERROR: {error}"
-        )
-
-        sys.exit(1)
+    asyncio.run(main())
